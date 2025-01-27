@@ -60,6 +60,7 @@ extend-exclude = [
     "*/migrations/*.py",
     "staticfiles/*",
 ]
+line-length=119
 
 [tool.ruff.lint]
 select = [
@@ -126,6 +127,12 @@ ignore = [
           # of types for comparison.
           # Deactivated because it can make the code slow:
           # https://github.com/astral-sh/ruff/issues/7871
+  # My Stuff
+  "COM812",
+  "T201",
+  "BLE001",
+  "F841",
+  "ERA001",
 ]
 # The fixes in extend-unsafe-fixes will require
 # provide the `--unsafe-fixes` flag when fixing.
