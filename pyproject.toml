@@ -133,6 +133,12 @@ ignore = [
   "BLE001",
   "F841",
   "ERA001",
+  "PLW2901",
+  "C901",
+  "G004",
+  "TRY400",
+  "PLR0912",
+  "PLR0915",
 ]
 # The fixes in extend-unsafe-fixes will require
 # provide the `--unsafe-fixes` flag when fixing.

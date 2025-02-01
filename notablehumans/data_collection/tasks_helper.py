@@ -1,3 +1,8 @@
+from datetime import datetime
+
+from django.utils.timezone import get_current_timezone
+
+
 def is_probably_human(title):
     """
     Determines if a Wikipedia title likely refers to a human based on keywords
@@ -27,39 +32,52 @@ def is_probably_human(title):
     return all(keyword.lower() not in title.lower() for keyword in non_human_keywords)
 
 
-def parse_and_store_m2m_field(
-    data,
-    model,
-    id_field="id",
-    label_field="label",
-):
+def parse_coordinates(coord_string):
     """
-    Parses concatenated field data and stores it in the specified model.
-
-    Args:
-        data (str): Concatenated string of data in the format `id||label|id||label`.
-        model (Model): The Django model class to store the data.
-        id_field (str): The field in the model representing the unique ID.
-        label_field (str): The field in the model representing the label.
-        delimiter (str): The delimiter between multiple entries.
-        pair_separator (str): The separator between ID and label in each entry.
-
-    Returns:
-        list: A list of model instances created or fetched.
+    Parse coordinate string into latitude and longitude.
     """
-    delimiter = "|"
-    pair_separator = "||"
-    instances = []
-    if data:
-        items = data.split(delimiter)
-        for item in items:
-            try:
-                item_id, item_label = item.split(pair_separator)
-                instance, _ = model.objects.get_or_create(
-                    **{id_field: item_id},
-                    defaults={label_field: item_label},
-                )
-                instances.append(instance)
-            except ValueError:
-                continue  # Skip malformed entries
-    return instances
+    if coord_string:
+        coord_parts = coord_string.replace("Point(", "").replace(")", "").split()
+        return float(coord_parts[1]), float(coord_parts[0])
+    return None, None
+
+
+def parse_date(date_values, date_statements):
+    # Initialize a set to hold valid date candidates
+    date_candidates = set()
+
+    # Add dobValues to candidates if it is not a URL and is valid date
+    if date_values:
+        for value in date_values.split("|"):
+            if not value.startswith("http"):  # Skip URLs
+                date_candidates.add(value.strip())  # Add cleaned value to set
+
+    # Add dobStatements to candidates
+    if date_statements:
+        for statement in date_statements.split("|"):
+            if not statement.startswith("http"):  # Skip URLs
+                date_candidates.add(statement.strip())  # Add cleaned statement to set
+
+    # If no valid date candidates found, return None
+    if not date_candidates:
+        return None, False
+
+    # Try to parse each candidate date string
+    for date_str in date_candidates:
+        try:
+            # Extract YYYY-MM-DD part (ignore the time portion)
+            date_str = date_str.split("T")[0]
+            if date_str[0] == "-":
+                date_str = date_str[1:]
+                is_bc = True
+            else:
+                is_bc = False
+
+            year, month, day = map(int, date_str.split("-"))
+
+            return datetime(year, month, day, tzinfo=get_current_timezone()).date(), is_bc
+
+        except ValueError:
+            continue  # Skip invalid date strings
+
+    return None, False  # No valid date found

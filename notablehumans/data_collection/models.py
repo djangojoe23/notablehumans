@@ -1,9 +1,11 @@
 from django.db import models
+from django.utils.timezone import now
 
 
 class Gender(models.Model):
     wikidata_id = models.CharField(max_length=255, primary_key=True)
     label = models.CharField(max_length=255, unique=True)
+    last_updated = models.DateTimeField(default=now)
 
     def __str__(self):
         return self.label
@@ -24,6 +26,7 @@ class Place(models.Model):
         null=True,
         blank=True,
     )
+    last_updated = models.DateTimeField(default=now)
 
     def __str__(self):
         return self.name
@@ -34,7 +37,9 @@ class NotableHuman(models.Model):
     name = models.CharField(max_length=255, blank=True)
     wikipedia_url = models.URLField(max_length=500, blank=True)
     birth_date = models.DateField(null=True, blank=True)
+    is_birth_bc = models.BooleanField(default=False)
     death_date = models.DateField(null=True, blank=True)
+    is_death_bc = models.BooleanField(default=False)  # Flag to mark BC dates
     gender = models.ManyToManyField(Gender, related_name="genders", blank=True)
     birth_place = models.ForeignKey(
         Place,
@@ -87,7 +92,7 @@ class NotableHuman(models.Model):
     created_at = models.DateTimeField(
         auto_now_add=True,
     )  # Timestamp for record creation
-    updated_at = models.DateTimeField(auto_now=True)  # Timestamp for record updates
+    last_updated = models.DateTimeField(auto_now=True)  # Timestamp for record updates
 
     def __str__(self):
         return f"{self.name or 'Unknown'} ({self.wikidata_id})"
