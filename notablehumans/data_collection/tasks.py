@@ -15,20 +15,21 @@ from SPARQLWrapper import JSON
 from SPARQLWrapper import SPARQLWrapper
 from SPARQLWrapper.SPARQLExceptions import QueryBadFormed
 
-from .models import Gender
+from .models import AttributeType
 from .models import NotableHuman
+from .models import NotableHumanAttribute
 from .models import Place
-from .tasks_helper import is_probably_human
-from .tasks_helper import parse_coordinates
-from .tasks_helper import parse_date
 
 logger = get_task_logger(__name__)
 
+
+ATTRIBUTE_CHOICES = list(AttributeType.values)
 REDIS_CLIENT = redis.StrictRedis(host="localhost", port=6379, db=0, decode_responses=True)
-LOCK_EXPIRE_TIME = 30  # 1 hour expiration for locks
+LOCK_EXPIRE_TIME = 30  # 30 second expiration for locks
 WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
 WIKIDATA_SPARQL_ENDPOINT = "https://query.wikidata.org/sparql"
 BATCH_SIZE = 50  # Number of titles per batch for SPARQL query
+OPTIONAL_FIELD_BATCH_SIZE = 5  # Chunk size of optional fields (attributes) per SPARQL query
 
 # Create a shared session object for reusing HTTP connections
 session = requests.Session()
@@ -46,7 +47,6 @@ def get_linked_titles_from_day(month, day):
     if REDIS_CLIENT.set(lock_key, "locked", ex=LOCK_EXPIRE_TIME, nx=True):
         try:
             day_title = f"{month}_{day}"
-            task_lock = f"lock-{day_title}"  # Unique identifier
 
             try:
                 all_titles = []
@@ -85,7 +85,7 @@ def get_linked_titles_from_day(month, day):
                 logger.info(
                     f"Extracted {len(all_titles)} potential human-related links for {day_title}.",
                 )
-                get_human_details_in_batches.apply_async(args=(all_titles,))
+                get_human_details_in_batches.apply_async(args=(month, day, all_titles))
 
                 return f"Processed {day_title}, found {len(all_titles)} titles."
 
@@ -100,13 +100,46 @@ def get_linked_titles_from_day(month, day):
         raise Ignore  # Ignore duplicate tasks
 
 
+def is_probably_human(title):
+    """
+    Determines if a Wikipedia title likely refers to a human based on keywords
+    and number patterns.
+    """
+
+    # Exclude titles with specific prefixes or generic terms
+    non_human_keywords = [
+        "Category:",
+        "Template:",
+        "Template talk:",
+        "File:",
+        "Talk:",
+        "List of",
+        "Portal:",
+        "Wikipedia:",
+    ]
+    # Check if the title starts or ends with a number
+    if title.lstrip().startswith(tuple("0123456789")) or title.rstrip().endswith(
+        tuple("0123456789"),
+    ):
+        # Allow titles with parentheses for birth-death years
+        if not title.endswith(")"):
+            return False
+
+    # Exclude titles containing specific keywords
+    return all(keyword.lower() not in title.lower() for keyword in non_human_keywords)
+
+
 @shared_task
-def get_human_details_in_batches(titles):
+def get_human_details_in_batches(month, day, titles):
     """
     Batch process titles and schedule SPARQL queries.
     """
     # Split titles into batches
     batches = [titles[i : i + BATCH_SIZE] for i in range(0, len(titles), BATCH_SIZE)]
+    task_id = str(int(time.time()))  # Unique ID for this execution
+
+    # Store the number of batches in Redis
+    REDIS_CLIENT.set(f"wiki_batches:{task_id}", len(batches))
 
     # Schedule tasks for each batch
     for batch in batches:
@@ -119,7 +152,9 @@ def get_human_details_in_batches(titles):
             logger.info(f"Batch already scheduled: skipping {batch_hash}")
             continue
 
-        get_human_details.apply_async(args=(batch,))
+        get_human_details.apply_async(args=(month, day, batch, task_id))
+
+    logger.info(f"Started processing {month} {day} {len(batches)} batches. Task ID: {task_id}")
 
 
 def get_query_lock_key(query):
@@ -127,8 +162,16 @@ def get_query_lock_key(query):
     return f"sparql_lock:{hashlib.sha256(query.encode()).hexdigest()}{int(time.time() // 60)}"
 
 
-@shared_task(rate_limit="5/m")
-def get_human_details(titles, max_retries=5, base_delay=2):
+def chunk_optional_fields(n):
+    """Yield successive n-sized chunks from lst."""
+    for i in range(0, len(ATTRIBUTE_CHOICES), n):
+        yield ATTRIBUTE_CHOICES[i : i + n]
+
+
+@shared_task(rate_limit="10/m")
+def get_human_details(month, day, titles, task_id):
+    max_retries = 5
+    base_delay = 2
     """
     Query Wikidata SPARQL endpoint for human details for a batch of titles.
     """
@@ -141,296 +184,250 @@ def get_human_details(titles, max_retries=5, base_delay=2):
         return
 
     try:
-        articles_str = " ".join(
-            [f"<https://en.wikipedia.org/wiki/{title.replace(' ', '_')}>" for title in titles],
-        )
-        sparql_query = f"""
-                SELECT ?item ?itemLabel ?article ?wikipediaUrl
-                       (GROUP_CONCAT(DISTINCT STR(?dob); separator="|") AS ?dobValues)
-                       (GROUP_CONCAT(DISTINCT STR(?dobStatement); separator="|") AS ?dobStatements)
-                       (GROUP_CONCAT(DISTINCT STR(?dod); separator="|") AS ?dodValues)
-                       (GROUP_CONCAT(DISTINCT STR(?dodStatement); separator="|") AS ?dodStatements)
-                       ?birthPlace ?birthPlaceLabel ?birthPlaceID ?birthPlaceCoordinates
-                       ?deathPlace ?deathPlaceLabel ?deathPlaceID ?deathPlaceCoordinates
-                       (GROUP_CONCAT(DISTINCT CONCAT(?genderID, "||", ?gender); SEPARATOR="@@") AS ?genderData)
-                WHERE {{
-                  VALUES ?article {{ {articles_str} }}
+        for attribute_batch in chunk_optional_fields(OPTIONAL_FIELD_BATCH_SIZE):
+            sparql_query = NotableHuman.get_sparql_query(titles, attribute_batch)
 
-                  ?article schema:about ?item.
+            query_lock_key = get_query_lock_key(sparql_query)
 
-                  ?item rdfs:label ?itemLabel;
-                        wdt:P31 wd:Q5.
-                  FILTER(LANG(?itemLabel) = "en")
-                  OPTIONAL {{
-                    ?wikipediaUrl schema:about ?article .
-                    FILTER(CONTAINS(STR(?wikipediaUrl), "en.wikipedia.org"))
-                  }}
-                  OPTIONAL {{ ?item wdt:P569 ?dob. }}         # Direct birth date
-                  OPTIONAL {{ ?item p:P569/ps:P569 ?dobStatement. }}  # Birth date statement
+            # Prevent duplicate queries from running simultaneously
+            if not REDIS_CLIENT.set(query_lock_key, "locked", ex=60, nx=True):
+                logger.info(f"Query already in progress with : {titles}")
+                return
 
-                  OPTIONAL {{ ?item wdt:P570 ?dod. }}         # Direct death date
-                  OPTIONAL {{ ?item p:P570 ?dodStatement. }}  # Death date statement
-                  OPTIONAL {{
-                    ?item wdt:P21 ?genderEntity.
-                    ?genderEntity rdfs:label ?gender.
-                    BIND(STRAFTER(STR(?genderEntity), "/entity/") AS ?genderID)
-                    FILTER(LANG(?gender) = "en")
-                  }}
-                  OPTIONAL {{
-                    ?item wdt:P19 ?birthPlace.
-                    ?birthPlace rdfs:label ?birthPlaceLabel;
-                      wdt:P625 ?birthPlaceCoordinates.
-                    BIND(STRAFTER(STR(?birthPlace), "/entity/") AS ?birthPlaceID)
-                    FILTER(LANG(?birthPlaceLabel) = "en")
-                  }}
-                  OPTIONAL {{
-                    ?item wdt:P20 ?deathPlace.
-                    ?deathPlace rdfs:label ?deathPlaceLabel;
-                      wdt:P625 ?deathPlaceCoordinates.
-                    BIND(STRAFTER(STR(?deathPlace), "/entity/") AS ?deathPlaceID)
-                    FILTER(LANG(?deathPlaceLabel) = "en")
-                  }}
-                }}
-                GROUP BY ?item ?itemLabel ?article ?wikipediaUrl ?dobValues ?dobStatements ?dodValues ?dodStatements
-                         ?birthPlace ?birthPlaceLabel ?birthPlaceID ?birthPlaceCoordinates
-                         ?deathPlace ?deathPlaceLabel ?deathPlaceID ?deathPlaceCoordinates
-                """
+            sparql = SPARQLWrapper(WIKIDATA_SPARQL_ENDPOINT)
+            sparql.setReturnFormat(JSON)
+            sparql.setQuery(sparql_query)
+            sparql.method = "POST"
 
-        query_lock_key = get_query_lock_key(sparql_query)
-
-        # Prevent duplicate queries from running simultaneously
-        if not REDIS_CLIENT.set(query_lock_key, "locked", ex=60, nx=True):
-            print(f"Query already in progress with : {titles}")
-            return  # Skip duplicate request
-
-        sparql = SPARQLWrapper(WIKIDATA_SPARQL_ENDPOINT)
-
-        sparql.setQuery(sparql_query)
-        sparql.setReturnFormat(JSON)
-        sparql.addCustomHttpHeader("User-Agent", "NotableHumans/1.0 (jcmeyer23@gmail.com)")
-
-        for attempt in range(max_retries):
-            try:
-                results = sparql.query().convert()
-                humans_to_create_dict = {}
-                humans_to_update_dict = {}
-                genders_to_create = {}
-                places_to_create = {}
-
-                existing_humans = {h.wikidata_id: h for h in NotableHuman.objects.all()}
-                existing_genders = {g.wikidata_id: g for g in Gender.objects.all()}
-                existing_places = {p.wikidata_id: p for p in Place.objects.all()}
-
-                recent_cutoff = now() - timedelta(minutes=1)  # Define a time window
-                recently_updated_humans = NotableHuman.objects.filter(last_updated__gte=recent_cutoff)
-                recently_updated_genders = Gender.objects.filter(last_updated__gte=recent_cutoff)
-                recently_updated_places = Place.objects.filter(last_updated__gte=recent_cutoff)
-                recent_human_ids = set(recently_updated_humans.values_list("wikidata_id", flat=True))
-                recent_gender_ids = set(recently_updated_genders.values_list("wikidata_id", flat=True))
-                recent_place_ids = set(recently_updated_places.values_list("wikidata_id", flat=True))
-
-                for result in results["results"]["bindings"]:
-                    wikidata_id = result["item"]["value"].split("/")[-1]
-                    if wikidata_id and wikidata_id in recent_human_ids:
-                        continue
-
-                    # Parse main fields
-                    name = result["itemLabel"]["value"]
-                    wikipedia_url = result.get("article", {}).get("value")
-                    birth_date, is_birth_bc = parse_date(
-                        result.get("dobValues", {}).get("value"), result.get("dobStatements", {}).get("value")
-                    )
-                    death_date, is_death_bc = parse_date(
-                        result.get("dodValues", {}).get("value"), result.get("dodStatements", {}).get("value")
-                    )
-
-                    # Parse and store genders
-                    gender_ids = []
-                    gender_data = result.get("genderData", {}).get("value")
-                    if gender_data:
-                        for gender_pair in gender_data.split("@@"):
-                            gender_id, gender_label = gender_pair.split("||")
-                            if gender_id:
-                                gender_ids.append(gender_id)  # Collect the gender ID
-                                if gender_id not in recent_gender_ids:
-                                    if gender_id in existing_genders:
-                                        # Update existing gender
-                                        gender = existing_genders[gender_id]
-                                        if gender.label != gender_label:
-                                            gender.label = gender_label
-                                            gender.last_updated = now()  # Mark as updated
-                                    elif gender_id not in genders_to_create:
-                                        # Prepare new gender for creation
-                                        genders_to_create[gender_id] = Gender(
-                                            wikidata_id=gender_id, label=gender_label
-                                        )
-
-                    # Parse and store places
-                    for place_label_key, place_id_key, coord_key in [
-                        ("birthPlaceLabel", "birthPlaceID", "birthPlaceCoordinates"),
-                        ("deathPlaceLabel", "deathPlaceID", "deathPlaceCoordinates"),
-                    ]:
-                        place_id = result.get(place_id_key, {}).get("value")
-                        if place_id and place_id not in recent_place_ids:
-                            place_data = {
-                                "name": result.get(place_label_key, {}).get("value"),
-                                "latitude": None
-                                if not coord_key
-                                else parse_coordinates(result.get(coord_key, {}).get("value"))[0],
-                                "longitude": None
-                                if not coord_key
-                                else parse_coordinates(result.get(coord_key, {}).get("value"))[1],
-                            }
-                            if place_id and place_id in existing_places:
-                                # Update existing place
-                                place = existing_places[place_id]
-                                if (
-                                    place.name != place_data["name"]
-                                    or place.latitude != place_data["latitude"]
-                                    or place.longitude != place_data["longitude"]
-                                ):
-                                    place.name = place_data["name"]
-                                    place.latitude = place_data["latitude"]
-                                    place.longitude = place_data["longitude"]
-                                    place.last_updated = now()  # Mark as updated
-                            elif place_id not in places_to_create:
-                                places_to_create[place_id] = Place(wikidata_id=place_id, **place_data)
-
-                    # Prepare human instance
-                    human_data = {
-                        "name": name,
-                        "wikipedia_url": wikipedia_url,
-                        "birth_date": birth_date,
-                        "is_birth_bc": is_birth_bc,
-                        "death_date": death_date,
-                        "is_death_bc": is_death_bc,
-                        "birth_place_id": result.get("birthPlaceID", {}).get("value"),
-                        "death_place_id": result.get("deathPlaceID", {}).get("value"),
-                        "genders": gender_ids,
-                    }
-                    if wikidata_id in existing_humans:
-                        # Update existing human
-                        human = existing_humans[wikidata_id]
-                        humans_to_update_dict[human] = human_data
-                    elif wikidata_id not in humans_to_create_dict:
-                        # Create new human
-                        humans_to_create_dict[wikidata_id] = human_data
-
-                # Perform bulk operations inside a transaction
+            for attempt in range(max_retries):
                 try:
-                    with transaction.atomic():
-                        Gender.objects.bulk_create(genders_to_create.values(), ignore_conflicts=True)
-                        existing_genders = {g.wikidata_id: g for g in Gender.objects.all()}
+                    results = sparql.query().convert()
 
-                        Place.objects.bulk_create(places_to_create.values(), ignore_conflicts=True)
-                        existing_places = {p.wikidata_id: p for p in Place.objects.all()}
+                    two_minutes_ago = now() - timedelta(minutes=2)  # Anything updated within this time is "recent"
+                    # However, anything updated with this time is too recent because I loop through the same
+                    # people multiple times to break up the SPARQL query
+                    # TODO: what i should do is loop through the queries but only bulk update or create AFTER all the
+                    one_minute_ago = now() - timedelta(minutes=1)
 
-                        humans_to_create = []
-                        for wikidata_id, human_data in humans_to_create_dict.items():
-                            human = NotableHuman(
-                                wikidata_id=wikidata_id,
-                                name=human_data["name"],
-                                wikipedia_url=human_data["wikipedia_url"],
-                                birth_date=human_data["birth_date"],
-                                is_birth_bc=human_data["is_birth_bc"],
-                                death_date=human_data["death_date"],
-                                is_death_bc=human_data["is_death_bc"],
-                                birth_place=existing_places.get(human_data["birth_place_id"])
-                                if human_data["birth_place_id"]
-                                else None,
-                                death_place=existing_places.get(human_data["death_place_id"])
-                                if human_data["death_place_id"]
-                                else None,
-                            )
-                            humans_to_create.append(human)
-                        NotableHuman.objects.bulk_create(humans_to_create, ignore_conflicts=True)
-                        if humans_to_create:
-                            logger.info(f"Created {len(humans_to_create)} humans including {humans_to_create[0]}")
+                    humans_to_create_dict = {}
+                    humans_to_update_dict = {}
+                    existing_humans = {h.wikidata_id: h for h in NotableHuman.objects.all()}
+                    recently_updated_humans = NotableHuman.objects.filter(
+                        last_updated__gte=two_minutes_ago, last_updated__lt=one_minute_ago
+                    )
+                    recent_human_ids = set(recently_updated_humans.values_list("wikidata_id", flat=True))
 
-                        # Map wikidata_id to actual NotableHuman instances
-                        humans_created_id_map = {
-                            h.wikidata_id: h
-                            for h in NotableHuman.objects.filter(wikidata_id__in=humans_to_create_dict.keys())
+                    places_to_create = {}
+                    existing_places = {p.wikidata_id: p for p in Place.objects.all()}
+                    recently_updated_places = Place.objects.filter(last_updated__gte=one_minute_ago)
+                    recent_place_ids = set(recently_updated_places.values_list("wikidata_id", flat=True))
+
+                    attributes_to_create = {}
+                    existing_attributes = {a.wikidata_id: a for a in NotableHumanAttribute.objects.all()}
+                    recently_updated_attributes = NotableHumanAttribute.objects.filter(
+                        last_updated__gte=one_minute_ago
+                    )
+                    recent_attribute_ids = set(recently_updated_attributes.values_list("wikidata_id", flat=True))
+
+                    for result in results["results"]["bindings"]:
+                        wikidata_id = result["item"]["value"].split("/")[-1]
+                        if wikidata_id and wikidata_id in recent_human_ids:
+                            continue
+
+                        # Parse main fields
+                        name = result["itemLabel"]["value"]
+                        wikipedia_url = result.get("article", {}).get("value")
+                        birth_date, is_birth_bc = NotableHuman.parse_date(
+                            result.get("dobValues", {}).get("value"), result.get("dobStatements", {}).get("value")
+                        )
+                        death_date, is_death_bc = NotableHuman.parse_date(
+                            result.get("dodValues", {}).get("value"), result.get("dodStatements", {}).get("value")
+                        )
+
+                        # Parse and store places
+                        places_to_create = Place.parse_and_update(result, recent_place_ids, existing_places)
+
+                        attribute_ids = []
+                        for attribute_choice in ATTRIBUTE_CHOICES:
+                            # Needs to ensure that the attribute_label matches the field in the SPARQL query
+                            attr_data = result.get(attribute_choice, {}).get("value")
+                            if attr_data:
+                                for attr_pair in attr_data.split("@@"):
+                                    attr_id, attr_label = attr_pair.split("||")
+                                    if attr_id:
+                                        attribute_ids.append(attr_id)
+                                        if attr_id not in recent_attribute_ids:
+                                            category_value = AttributeType(attribute_choice).value
+                                            if attr_id in existing_attributes:
+                                                # Update existing attribute
+                                                attribute = existing_attributes[attr_id]
+                                                if (
+                                                    attribute.label != attr_label
+                                                    or attribute.category != category_value
+                                                ):
+                                                    attribute.label = attr_label
+                                                    attribute.category = category_value
+                                                    attribute.last_updated = now()  # Mark as updated
+                                                    attribute.save()
+                                            elif attr_id not in attributes_to_create:
+                                                # Prepare new gender for creation
+                                                attributes_to_create[attr_id] = NotableHumanAttribute(
+                                                    wikidata_id=attr_id, label=attr_label, category=category_value
+                                                )
+
+                        # Prepare human instance
+                        human_data = {
+                            "name": name,
+                            "wikipedia_url": wikipedia_url,
+                            "birth_date": birth_date,
+                            "is_birth_bc": is_birth_bc,
+                            "death_date": death_date,
+                            "is_death_bc": is_death_bc,
+                            "birth_place_id": result.get("birthPlaceID", {}).get("value"),
+                            "death_place_id": result.get("deathPlaceID", {}).get("value"),
+                            "attributes": attribute_ids,
                         }
 
-                        # Handle ManyToMany: Genders ↔ Humans
-                        human_gender_relations = []
-                        for wikidata_id, human_data in humans_to_create_dict.items():
-                            human = humans_created_id_map.get(wikidata_id)
-                            if human:
-                                for gender_id in human_data["genders"]:
-                                    gender = existing_genders.get(gender_id)
-                                    if gender:
-                                        human_gender_relations.append(
-                                            human.gender.through(notablehuman=human, gender=gender)
-                                        )
+                        if wikidata_id in existing_humans:
+                            # Update existing human
+                            human = existing_humans[wikidata_id]
+                            humans_to_update_dict[human] = human_data
+                        elif wikidata_id not in humans_to_create_dict:
+                            # Create new human
+                            humans_to_create_dict[wikidata_id] = human_data
 
-                        # Bulk create gender relationships
-                        NotableHuman.gender.through.objects.bulk_create(human_gender_relations, ignore_conflicts=True)
+                    # Perform bulk operations inside a transaction
+                    try:
+                        with transaction.atomic():
+                            Place.objects.bulk_create(places_to_create.values(), ignore_conflicts=True)
+                            existing_places = {p.wikidata_id: p for p in Place.objects.all()}
 
-                        humans_to_update = []
-                        for human, human_data in humans_to_update_dict.items():
-                            human.name = human_data["name"]
-                            human.wikipedia_url = human_data["wikipedia_url"]
-                            human.birth_date = human_data["birth_date"]
-                            human.is_birth_bc = human_data["is_birth_bc"]
-                            human.death_date = human_data["death_date"]
-                            human.is_death_bc = human_data["is_death_bc"]
-                            human.birth_place = (
-                                existing_places.get(human_data["birth_place_id"])
-                                if human_data["birth_place_id"]
-                                else None
+                            NotableHumanAttribute.objects.bulk_create(
+                                attributes_to_create.values(), ignore_conflicts=True
                             )
-                            human.death_place = (
-                                existing_places.get(human_data["death_place_id"])
-                                if human_data["death_place_id"]
-                                else None
+                            existing_attributes = {a.wikidata_id: a for a in NotableHumanAttribute.objects.all()}
+
+                            humans_to_create = []
+                            for wikidata_id, human_data in humans_to_create_dict.items():
+                                human = NotableHuman(
+                                    wikidata_id=wikidata_id,
+                                    name=human_data["name"],
+                                    wikipedia_url=human_data["wikipedia_url"],
+                                    birth_date=human_data["birth_date"],
+                                    is_birth_bc=human_data["is_birth_bc"],
+                                    death_date=human_data["death_date"],
+                                    is_death_bc=human_data["is_death_bc"],
+                                    birth_place=existing_places.get(human_data["birth_place_id"])
+                                    if human_data["birth_place_id"]
+                                    else None,
+                                    death_place=existing_places.get(human_data["death_place_id"])
+                                    if human_data["death_place_id"]
+                                    else None,
+                                )
+                                humans_to_create.append(human)
+                            NotableHuman.objects.bulk_create(humans_to_create, ignore_conflicts=True)
+                            if humans_to_create:
+                                logger.info(f"Created {len(humans_to_create)} humans including {humans_to_create[0]}")
+
+                            # Map wikidata_id to actual NotableHuman instances
+                            humans_created_id_map = {
+                                h.wikidata_id: h
+                                for h in NotableHuman.objects.filter(wikidata_id__in=humans_to_create_dict.keys())
+                            }
+
+                            # Handle ManyToMany: Attributes ↔ Humans
+                            human_attribute_relations = []
+                            for wikidata_id, human_data in humans_to_create_dict.items():
+                                human = humans_created_id_map.get(wikidata_id)
+                                if human:
+                                    for attr_id in human_data["attributes"]:
+                                        attribute = existing_attributes.get(attr_id)
+                                        if attribute:
+                                            human_attribute_relations.append(
+                                                human.attributes.through(
+                                                    notablehuman=human, notablehumanattribute=attribute
+                                                )
+                                            )
+
+                            # Bulk create attribute relationships
+                            NotableHuman.attributes.through.objects.bulk_create(
+                                human_attribute_relations, ignore_conflicts=True
                             )
-                            human.last_updated = now()
-                            humans_to_update.append(human)
 
-                        # Perform bulk update
-                        NotableHuman.objects.bulk_update(
-                            humans_to_update,
-                            fields=[
-                                "name",
-                                "wikipedia_url",
-                                "birth_date",
-                                "is_birth_bc",
-                                "death_date",
-                                "is_death_bc",
-                                "birth_place",
-                                "death_place",
-                                "last_updated",
-                            ],
-                        )
-                        if humans_to_update:
-                            logger.info(f"Updated {len(humans_to_update)} humans including {humans_to_update[0]}")
+                            humans_to_update = []
+                            for human, human_data in humans_to_update_dict.items():
+                                human.name = human_data["name"]
+                                human.wikipedia_url = human_data["wikipedia_url"]
+                                human.birth_date = human_data["birth_date"]
+                                human.is_birth_bc = human_data["is_birth_bc"]
+                                human.death_date = human_data["death_date"]
+                                human.is_death_bc = human_data["is_death_bc"]
+                                human.birth_place = (
+                                    existing_places.get(human_data["birth_place_id"])
+                                    if human_data["birth_place_id"]
+                                    else None
+                                )
+                                human.death_place = (
+                                    existing_places.get(human_data["death_place_id"])
+                                    if human_data["death_place_id"]
+                                    else None
+                                )
+                                human.last_updated = now()
+                                humans_to_update.append(human)
 
-                        # Handle ManyToMany: Genders ↔ Updated Humans
-                        for human, human_data in humans_to_update_dict.items():
-                            gender_objs = [
-                                existing_genders[gender_id]
-                                for gender_id in human_data["genders"]
-                                if gender_id in existing_genders
-                            ]
-                            human.gender.set(gender_objs)  # This ensures the M2M field is updated
+                            # Perform bulk update
+                            NotableHuman.objects.bulk_update(
+                                humans_to_update,
+                                fields=[
+                                    "name",
+                                    "wikipedia_url",
+                                    "birth_date",
+                                    "is_birth_bc",
+                                    "death_date",
+                                    "is_death_bc",
+                                    "birth_place",
+                                    "death_place",
+                                    "last_updated",
+                                ],
+                            )
+                            if humans_to_update:
+                                logger.info(f"Updated {len(humans_to_update)} humans including {humans_to_update[0]}")
 
+                            # Handle ManyToMany: Attributes ↔ Updated Humans
+                            for human, human_data in humans_to_update_dict.items():
+                                attribute_objs = [
+                                    existing_attributes[attr_id]
+                                    for attr_id in human_data["attributes"]
+                                    if attr_id in existing_attributes
+                                ]
+                                human.attributes.add(*attribute_objs)  # This ensures the M2M field is updated
+
+                    except Exception as e:
+                        logger.error(f"Transaction failed: {e}")
+                except QueryBadFormed as e:
+                    logger.error(f"SPARQL query malformed {e}")
+                    break  # Don't retry if the query itself is incorrect
                 except Exception as e:
-                    logger.error(f"Transaction failed: {e}")
-            except QueryBadFormed as e:
-                logger.error(f"SPARQL query malformed {e}")
-                break  # Don't retry if the query itself is incorrect
-            except Exception as e:
-                if "429" in str(e):
-                    retry_after = base_delay * (2**attempt)  # Exponential backoff
-                    logger.info(f"Rate limit hit. Retrying in {retry_after} seconds...")
-                    time.sleep(retry_after)
-                    continue
-                logger.error(f"SPARQL query failed: {e}")
-                break
+                    if "429" in str(e):
+                        retry_after = base_delay * (2**attempt)  # Exponential backoff
+                        logger.info(f"Rate limit hit. Retrying in {retry_after} seconds...")
+                        time.sleep(retry_after)
+                        continue
+                    logger.error(f"SPARQL query failed: {e}")
+                    break
+    except Exception as e:
+        logger.error(f"Error in get_human_details: {e}")
     finally:
         REDIS_CLIENT.delete(lock_key)  # Release lock after processing
+
+        # Decrement the batch counter
+        remaining = REDIS_CLIENT.decr(f"wiki_batches:{task_id}")
+
+        # Log when all batches are done
+        if remaining > 0:
+            logger.info(f"{remaining} batches left for {month} {day} to process for task {task_id}.")
+        else:
+            logger.info(f"All Wikipedia batches have been queried for {month} {day} task {task_id}!")
 
 
 @shared_task
@@ -444,11 +441,11 @@ def schedule_data_collection():
         "January",  # "February", "March", "April", "May", "June",
         # "July", "August", "September", "October", "November", "December"
     ]:
-        for day in range(1, 2):
+        for day in range(10, 11):
             lock_key = f"wiki_task:{month}:{day}"
             # Check if a task is already scheduled
             if REDIS_CLIENT.exists(lock_key):
-                print(f"Skipping {month} {day}, already scheduled.")
+                logger.info(f"Skipping {month} {day}, already scheduled.")
                 continue  # Skip duplicate tasks
 
             tasks.append(get_linked_titles_from_day.s(month, day))
