@@ -140,7 +140,46 @@ class NotableHuman(models.Model):
         return f"{self.name or 'Unknown'} ({self.wikidata_id})"
 
     @staticmethod
-    def get_sparql_query(titles, attribute_batch):
+    def get_sparql_query(titles, attribute_batch, is_first_batch):
+        if is_first_batch:
+            query_select = """SELECT ?item ?itemLabel ?article ?wikipediaUrl
+                          (GROUP_CONCAT(DISTINCT STR(?dob); separator="|") AS ?dobValues)
+                          (GROUP_CONCAT(DISTINCT STR(?dobStatement); separator="|") AS ?dobStatements)
+                          (GROUP_CONCAT(DISTINCT STR(?dod); separator="|") AS ?dodValues)
+                          (GROUP_CONCAT(DISTINCT STR(?dodStatement); separator="|") AS ?dodStatements)
+                          ?birthPlace ?birthPlaceLabel ?birthPlaceID ?birthPlaceCoordinates
+                          ?deathPlace ?deathPlaceLabel ?deathPlaceID ?deathPlaceCoordinates"""
+            query_body = """OPTIONAL {{
+                       ?wikipediaUrl schema:about ?article .
+                       FILTER(CONTAINS(STR(?wikipediaUrl), "en.wikipedia.org"))
+                     }}
+                     OPTIONAL {{ ?item wdt:P569 ?dob. }}         # Direct birth date
+                     OPTIONAL {{ ?item p:P569/ps:P569 ?dobStatement. }}  # Birth date statement
+
+                     OPTIONAL {{ ?item wdt:P570 ?dod. }}         # Direct death date
+                     OPTIONAL {{ ?item p:P570 ?dodStatement. }}  # Death date statement
+                     OPTIONAL {{
+                       ?item wdt:P19 ?birthPlace.
+                       ?birthPlace rdfs:label ?birthPlaceLabel;
+                         wdt:P625 ?birthPlaceCoordinates.
+                       BIND(STRAFTER(STR(?birthPlace), "/entity/") AS ?birthPlaceID)
+                       FILTER(LANG(?birthPlaceLabel) = "en")
+                     }}
+                     OPTIONAL {{
+                       ?item wdt:P20 ?deathPlace.
+                       ?deathPlace rdfs:label ?deathPlaceLabel;
+                         wdt:P625 ?deathPlaceCoordinates.
+                       BIND(STRAFTER(STR(?deathPlace), "/entity/") AS ?deathPlaceID)
+                       FILTER(LANG(?deathPlaceLabel) = "en")
+                     }}"""
+            query_groupbys = """?article ?wikipediaUrl ?dobValues ?dobStatements ?dodValues ?dodStatements
+                            ?birthPlace ?birthPlaceLabel ?birthPlaceID ?birthPlaceCoordinates
+                            ?deathPlace ?deathPlaceLabel ?deathPlaceID ?deathPlaceCoordinates"""
+        else:
+            query_select = """SELECT ?item ?itemLabel"""
+            query_body = ""
+            query_groupbys = ""
+
         optional_fields = {
             "gender": "P21",
             "occupation": "P106",
@@ -195,14 +234,7 @@ class NotableHuman(models.Model):
         articles_str = " ".join(
             [f"<https://en.wikipedia.org/wiki/{title.replace(' ', '_')}>" for title in titles],
         )
-        return f"""
-                   SELECT ?item ?itemLabel ?article ?wikipediaUrl
-                          (GROUP_CONCAT(DISTINCT STR(?dob); separator="|") AS ?dobValues)
-                          (GROUP_CONCAT(DISTINCT STR(?dobStatement); separator="|") AS ?dobStatements)
-                          (GROUP_CONCAT(DISTINCT STR(?dod); separator="|") AS ?dodValues)
-                          (GROUP_CONCAT(DISTINCT STR(?dodStatement); separator="|") AS ?dodStatements)
-                          ?birthPlace ?birthPlaceLabel ?birthPlaceID ?birthPlaceCoordinates
-                          ?deathPlace ?deathPlaceLabel ?deathPlaceID ?deathPlaceCoordinates
+        return f""" {query_select}
                           {optional_group_concats}
                    WHERE {{
                      VALUES ?article {{ {articles_str} }}
@@ -212,34 +244,10 @@ class NotableHuman(models.Model):
                      ?item rdfs:label ?itemLabel;
                            wdt:P31 wd:Q5.
                      FILTER(LANG(?itemLabel) = "en")
-                     OPTIONAL {{
-                       ?wikipediaUrl schema:about ?article .
-                       FILTER(CONTAINS(STR(?wikipediaUrl), "en.wikipedia.org"))
-                     }}
-                     OPTIONAL {{ ?item wdt:P569 ?dob. }}         # Direct birth date
-                     OPTIONAL {{ ?item p:P569/ps:P569 ?dobStatement. }}  # Birth date statement
-
-                     OPTIONAL {{ ?item wdt:P570 ?dod. }}         # Direct death date
-                     OPTIONAL {{ ?item p:P570 ?dodStatement. }}  # Death date statement
-                     OPTIONAL {{
-                       ?item wdt:P19 ?birthPlace.
-                       ?birthPlace rdfs:label ?birthPlaceLabel;
-                         wdt:P625 ?birthPlaceCoordinates.
-                       BIND(STRAFTER(STR(?birthPlace), "/entity/") AS ?birthPlaceID)
-                       FILTER(LANG(?birthPlaceLabel) = "en")
-                     }}
-                     OPTIONAL {{
-                       ?item wdt:P20 ?deathPlace.
-                       ?deathPlace rdfs:label ?deathPlaceLabel;
-                         wdt:P625 ?deathPlaceCoordinates.
-                       BIND(STRAFTER(STR(?deathPlace), "/entity/") AS ?deathPlaceID)
-                       FILTER(LANG(?deathPlaceLabel) = "en")
-                     }}
+                     {query_body}
                      {optional_statements}
                    }}
-                   GROUP BY ?item ?itemLabel ?article ?wikipediaUrl ?dobValues ?dobStatements ?dodValues ?dodStatements
-                            ?birthPlace ?birthPlaceLabel ?birthPlaceID ?birthPlaceCoordinates
-                            ?deathPlace ?deathPlaceLabel ?deathPlaceID ?deathPlaceCoordinates
+                   GROUP BY ?item ?itemLabel {query_groupbys}
                    """
 
     @staticmethod

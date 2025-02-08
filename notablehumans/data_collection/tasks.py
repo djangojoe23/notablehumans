@@ -168,7 +168,7 @@ def chunk_optional_fields(n):
         yield ATTRIBUTE_CHOICES[i : i + n]
 
 
-@shared_task(rate_limit="10/m")
+@shared_task(rate_limit="5/m")
 def get_human_details(month, day, titles, task_id):
     max_retries = 5
     base_delay = 2
@@ -183,9 +183,31 @@ def get_human_details(month, day, titles, task_id):
         logger.info(f"Human details batch already processing: skipping {batch_hash}")
         return
 
+    # Anything updated within this time is "recent" and will not get updated
+    two_minutes_ago = now() - timedelta(minutes=2)
+    one_minute_ago = now() - timedelta(minutes=1)
+
+    humans_to_create_dict = {}
+    humans_to_update_dict = {}
+    existing_humans = {h.wikidata_id: h for h in NotableHuman.objects.all()}
+    recently_updated_humans = NotableHuman.objects.filter(
+        last_updated__gte=two_minutes_ago, last_updated__lt=one_minute_ago
+    )
+    recent_human_ids = set(recently_updated_humans.values_list("wikidata_id", flat=True))
+
+    places_to_create = {}
+    existing_places = {p.wikidata_id: p for p in Place.objects.all()}
+    recently_updated_places = Place.objects.filter(last_updated__gte=two_minutes_ago)
+    recent_place_ids = set(recently_updated_places.values_list("wikidata_id", flat=True))
+
+    attributes_to_create = {}
+    existing_attributes = {a.wikidata_id: a for a in NotableHumanAttribute.objects.all()}
+    recently_updated_attributes = NotableHumanAttribute.objects.filter(last_updated__gte=two_minutes_ago)
+    recent_attribute_ids = set(recently_updated_attributes.values_list("wikidata_id", flat=True))
     try:
+        is_first_batch = True
         for attribute_batch in chunk_optional_fields(OPTIONAL_FIELD_BATCH_SIZE):
-            sparql_query = NotableHuman.get_sparql_query(titles, attribute_batch)
+            sparql_query = NotableHuman.get_sparql_query(titles, attribute_batch, is_first_batch)
 
             query_lock_key = get_query_lock_key(sparql_query)
 
@@ -198,36 +220,11 @@ def get_human_details(month, day, titles, task_id):
             sparql.setReturnFormat(JSON)
             sparql.setQuery(sparql_query)
             sparql.method = "POST"
+            sparql.addCustomHttpHeader("User-Agent", "NotableHumans/1.0 (mailto:jcmeyer23@gmail.com)")
 
             for attempt in range(max_retries):
                 try:
                     results = sparql.query().convert()
-
-                    two_minutes_ago = now() - timedelta(minutes=2)  # Anything updated within this time is "recent"
-                    # However, anything updated with this time is too recent because I loop through the same
-                    # people multiple times to break up the SPARQL query
-                    # TODO: what i should do is loop through the queries but only bulk update or create AFTER all the
-                    one_minute_ago = now() - timedelta(minutes=1)
-
-                    humans_to_create_dict = {}
-                    humans_to_update_dict = {}
-                    existing_humans = {h.wikidata_id: h for h in NotableHuman.objects.all()}
-                    recently_updated_humans = NotableHuman.objects.filter(
-                        last_updated__gte=two_minutes_ago, last_updated__lt=one_minute_ago
-                    )
-                    recent_human_ids = set(recently_updated_humans.values_list("wikidata_id", flat=True))
-
-                    places_to_create = {}
-                    existing_places = {p.wikidata_id: p for p in Place.objects.all()}
-                    recently_updated_places = Place.objects.filter(last_updated__gte=one_minute_ago)
-                    recent_place_ids = set(recently_updated_places.values_list("wikidata_id", flat=True))
-
-                    attributes_to_create = {}
-                    existing_attributes = {a.wikidata_id: a for a in NotableHumanAttribute.objects.all()}
-                    recently_updated_attributes = NotableHumanAttribute.objects.filter(
-                        last_updated__gte=one_minute_ago
-                    )
-                    recent_attribute_ids = set(recently_updated_attributes.values_list("wikidata_id", flat=True))
 
                     for result in results["results"]["bindings"]:
                         wikidata_id = result["item"]["value"].split("/")[-1]
@@ -236,20 +233,32 @@ def get_human_details(month, day, titles, task_id):
 
                         # Parse main fields
                         name = result["itemLabel"]["value"]
-                        wikipedia_url = result.get("article", {}).get("value")
-                        birth_date, is_birth_bc = NotableHuman.parse_date(
-                            result.get("dobValues", {}).get("value"), result.get("dobStatements", {}).get("value")
-                        )
-                        death_date, is_death_bc = NotableHuman.parse_date(
-                            result.get("dodValues", {}).get("value"), result.get("dodStatements", {}).get("value")
-                        )
-
-                        # Parse and store places
-                        places_to_create = Place.parse_and_update(result, recent_place_ids, existing_places)
+                        human_data = {"name": name}
+                        if is_first_batch:
+                            wikipedia_url = result.get("article", {}).get("value")
+                            birth_date, is_birth_bc = NotableHuman.parse_date(
+                                result.get("dobValues", {}).get("value"), result.get("dobStatements", {}).get("value")
+                            )
+                            death_date, is_death_bc = NotableHuman.parse_date(
+                                result.get("dodValues", {}).get("value"), result.get("dodStatements", {}).get("value")
+                            )
+                            human_data.update(
+                                {
+                                    "wikipedia_url": wikipedia_url,
+                                    "birth_date": birth_date,
+                                    "is_birth_bc": is_birth_bc,
+                                    "death_date": death_date,
+                                    "is_death_bc": is_death_bc,
+                                    "birth_place_id": result.get("birthPlaceID", {}).get("value"),
+                                    "death_place_id": result.get("deathPlaceID", {}).get("value"),
+                                }
+                            )
+                            # Parse and store places
+                            places_to_create.update(Place.parse_and_update(result, recent_place_ids, existing_places))
 
                         attribute_ids = []
                         for attribute_choice in ATTRIBUTE_CHOICES:
-                            # Needs to ensure that the attribute_label matches the field in the SPARQL query
+                            # Needs to ensure that the attribute_choice matches the field in the SPARQL query
                             attr_data = result.get(attribute_choice, {}).get("value")
                             if attr_data:
                                 for attr_pair in attr_data.split("@@"):
@@ -275,135 +284,24 @@ def get_human_details(month, day, titles, task_id):
                                                     wikidata_id=attr_id, label=attr_label, category=category_value
                                                 )
 
-                        # Prepare human instance
-                        human_data = {
-                            "name": name,
-                            "wikipedia_url": wikipedia_url,
-                            "birth_date": birth_date,
-                            "is_birth_bc": is_birth_bc,
-                            "death_date": death_date,
-                            "is_death_bc": is_death_bc,
-                            "birth_place_id": result.get("birthPlaceID", {}).get("value"),
-                            "death_place_id": result.get("deathPlaceID", {}).get("value"),
-                            "attributes": attribute_ids,
-                        }
-
                         if wikidata_id in existing_humans:
                             # Update existing human
                             human = existing_humans[wikidata_id]
-                            humans_to_update_dict[human] = human_data
+                            if human not in humans_to_update_dict:
+                                humans_to_update_dict[human] = human_data
+                                humans_to_update_dict[human]["attributes"] = attribute_ids
+                            else:
+                                humans_to_update_dict[human].update(human_data)
+                                humans_to_update_dict[human]["attributes"] += attribute_ids
                         elif wikidata_id not in humans_to_create_dict:
                             # Create new human
-                            humans_to_create_dict[wikidata_id] = human_data
+                            if wikidata_id not in humans_to_create_dict:
+                                humans_to_create_dict[wikidata_id] = human_data
+                                humans_to_create_dict[wikidata_id]["attributes"] = attribute_ids
+                            else:
+                                humans_to_create_dict[wikidata_id].update(human_data)
+                                humans_to_create_dict[wikidata_id]["attributes"] += attribute_ids
 
-                    # Perform bulk operations inside a transaction
-                    try:
-                        with transaction.atomic():
-                            Place.objects.bulk_create(places_to_create.values(), ignore_conflicts=True)
-                            existing_places = {p.wikidata_id: p for p in Place.objects.all()}
-
-                            NotableHumanAttribute.objects.bulk_create(
-                                attributes_to_create.values(), ignore_conflicts=True
-                            )
-                            existing_attributes = {a.wikidata_id: a for a in NotableHumanAttribute.objects.all()}
-
-                            humans_to_create = []
-                            for wikidata_id, human_data in humans_to_create_dict.items():
-                                human = NotableHuman(
-                                    wikidata_id=wikidata_id,
-                                    name=human_data["name"],
-                                    wikipedia_url=human_data["wikipedia_url"],
-                                    birth_date=human_data["birth_date"],
-                                    is_birth_bc=human_data["is_birth_bc"],
-                                    death_date=human_data["death_date"],
-                                    is_death_bc=human_data["is_death_bc"],
-                                    birth_place=existing_places.get(human_data["birth_place_id"])
-                                    if human_data["birth_place_id"]
-                                    else None,
-                                    death_place=existing_places.get(human_data["death_place_id"])
-                                    if human_data["death_place_id"]
-                                    else None,
-                                )
-                                humans_to_create.append(human)
-                            NotableHuman.objects.bulk_create(humans_to_create, ignore_conflicts=True)
-                            if humans_to_create:
-                                logger.info(f"Created {len(humans_to_create)} humans including {humans_to_create[0]}")
-
-                            # Map wikidata_id to actual NotableHuman instances
-                            humans_created_id_map = {
-                                h.wikidata_id: h
-                                for h in NotableHuman.objects.filter(wikidata_id__in=humans_to_create_dict.keys())
-                            }
-
-                            # Handle ManyToMany: Attributes ↔ Humans
-                            human_attribute_relations = []
-                            for wikidata_id, human_data in humans_to_create_dict.items():
-                                human = humans_created_id_map.get(wikidata_id)
-                                if human:
-                                    for attr_id in human_data["attributes"]:
-                                        attribute = existing_attributes.get(attr_id)
-                                        if attribute:
-                                            human_attribute_relations.append(
-                                                human.attributes.through(
-                                                    notablehuman=human, notablehumanattribute=attribute
-                                                )
-                                            )
-
-                            # Bulk create attribute relationships
-                            NotableHuman.attributes.through.objects.bulk_create(
-                                human_attribute_relations, ignore_conflicts=True
-                            )
-
-                            humans_to_update = []
-                            for human, human_data in humans_to_update_dict.items():
-                                human.name = human_data["name"]
-                                human.wikipedia_url = human_data["wikipedia_url"]
-                                human.birth_date = human_data["birth_date"]
-                                human.is_birth_bc = human_data["is_birth_bc"]
-                                human.death_date = human_data["death_date"]
-                                human.is_death_bc = human_data["is_death_bc"]
-                                human.birth_place = (
-                                    existing_places.get(human_data["birth_place_id"])
-                                    if human_data["birth_place_id"]
-                                    else None
-                                )
-                                human.death_place = (
-                                    existing_places.get(human_data["death_place_id"])
-                                    if human_data["death_place_id"]
-                                    else None
-                                )
-                                human.last_updated = now()
-                                humans_to_update.append(human)
-
-                            # Perform bulk update
-                            NotableHuman.objects.bulk_update(
-                                humans_to_update,
-                                fields=[
-                                    "name",
-                                    "wikipedia_url",
-                                    "birth_date",
-                                    "is_birth_bc",
-                                    "death_date",
-                                    "is_death_bc",
-                                    "birth_place",
-                                    "death_place",
-                                    "last_updated",
-                                ],
-                            )
-                            if humans_to_update:
-                                logger.info(f"Updated {len(humans_to_update)} humans including {humans_to_update[0]}")
-
-                            # Handle ManyToMany: Attributes ↔ Updated Humans
-                            for human, human_data in humans_to_update_dict.items():
-                                attribute_objs = [
-                                    existing_attributes[attr_id]
-                                    for attr_id in human_data["attributes"]
-                                    if attr_id in existing_attributes
-                                ]
-                                human.attributes.add(*attribute_objs)  # This ensures the M2M field is updated
-
-                    except Exception as e:
-                        logger.error(f"Transaction failed: {e}")
                 except QueryBadFormed as e:
                     logger.error(f"SPARQL query malformed {e}")
                     break  # Don't retry if the query itself is incorrect
@@ -415,6 +313,104 @@ def get_human_details(month, day, titles, task_id):
                         continue
                     logger.error(f"SPARQL query failed: {e}")
                     break
+            is_first_batch = False
+        # Perform bulk operations inside a transaction
+        try:
+            with transaction.atomic():
+                Place.objects.bulk_create(places_to_create.values(), ignore_conflicts=True)
+                existing_places = {p.wikidata_id: p for p in Place.objects.all()}
+
+                NotableHumanAttribute.objects.bulk_create(attributes_to_create.values(), ignore_conflicts=True)
+                existing_attributes = {a.wikidata_id: a for a in NotableHumanAttribute.objects.all()}
+
+                humans_to_create = []
+                for wikidata_id, human_data in humans_to_create_dict.items():
+                    human = NotableHuman(
+                        wikidata_id=wikidata_id,
+                        name=human_data["name"],
+                        wikipedia_url=human_data["wikipedia_url"],
+                        birth_date=human_data["birth_date"],
+                        is_birth_bc=human_data["is_birth_bc"],
+                        death_date=human_data["death_date"],
+                        is_death_bc=human_data["is_death_bc"],
+                        birth_place=existing_places.get(human_data["birth_place_id"])
+                        if human_data["birth_place_id"]
+                        else None,
+                        death_place=existing_places.get(human_data["death_place_id"])
+                        if human_data["death_place_id"]
+                        else None,
+                    )
+                    humans_to_create.append(human)
+                NotableHuman.objects.bulk_create(humans_to_create, ignore_conflicts=True)
+                if humans_to_create:
+                    logger.info(f"Created {len(humans_to_create)} humans including {humans_to_create[0]}")
+
+                # Map wikidata_id to actual NotableHuman instances
+                humans_created_id_map = {
+                    h.wikidata_id: h for h in NotableHuman.objects.filter(wikidata_id__in=humans_to_create_dict.keys())
+                }
+
+                # Handle ManyToMany: Attributes ↔ Humans
+                human_attribute_relations = []
+                for wikidata_id, human_data in humans_to_create_dict.items():
+                    human = humans_created_id_map.get(wikidata_id)
+                    if human:
+                        for attr_id in human_data["attributes"]:
+                            attribute = existing_attributes.get(attr_id)
+                            if attribute:
+                                human_attribute_relations.append(
+                                    human.attributes.through(notablehuman=human, notablehumanattribute=attribute)
+                                )
+
+                # Bulk create attribute relationships
+                NotableHuman.attributes.through.objects.bulk_create(human_attribute_relations, ignore_conflicts=True)
+
+                humans_to_update = []
+                for human, human_data in humans_to_update_dict.items():
+                    human.name = human_data["name"]
+                    human.wikipedia_url = human_data["wikipedia_url"]
+                    human.birth_date = human_data["birth_date"]
+                    human.is_birth_bc = human_data["is_birth_bc"]
+                    human.death_date = human_data["death_date"]
+                    human.is_death_bc = human_data["is_death_bc"]
+                    human.birth_place = (
+                        existing_places.get(human_data["birth_place_id"]) if human_data["birth_place_id"] else None
+                    )
+                    human.death_place = (
+                        existing_places.get(human_data["death_place_id"]) if human_data["death_place_id"] else None
+                    )
+                    human.last_updated = now()
+                    humans_to_update.append(human)
+
+                # Perform bulk update
+                NotableHuman.objects.bulk_update(
+                    humans_to_update,
+                    fields=[
+                        "name",
+                        "wikipedia_url",
+                        "birth_date",
+                        "is_birth_bc",
+                        "death_date",
+                        "is_death_bc",
+                        "birth_place",
+                        "death_place",
+                        "last_updated",
+                    ],
+                )
+                if humans_to_update:
+                    logger.info(f"Updated {len(humans_to_update)} humans including {humans_to_update[0]}")
+
+                # Handle ManyToMany: Attributes ↔ Updated Humans
+                for human, human_data in humans_to_update_dict.items():
+                    attribute_objs = [
+                        existing_attributes[attr_id]
+                        for attr_id in human_data["attributes"]
+                        if attr_id in existing_attributes
+                    ]
+                    human.attributes.add(*attribute_objs)  # This ensures the M2M field is updated
+
+        except Exception as e:
+            logger.error(f"Transaction failed: {e}")
     except Exception as e:
         logger.error(f"Error in get_human_details: {e}")
     finally:
@@ -441,7 +437,7 @@ def schedule_data_collection():
         "January",  # "February", "March", "April", "May", "June",
         # "July", "August", "September", "October", "November", "December"
     ]:
-        for day in range(10, 11):
+        for day in range(20, 21):
             lock_key = f"wiki_task:{month}:{day}"
             # Check if a task is already scheduled
             if REDIS_CLIENT.exists(lock_key):
