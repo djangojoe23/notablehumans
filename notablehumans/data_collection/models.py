@@ -1,4 +1,5 @@
 from datetime import datetime
+from urllib.parse import quote
 
 from django.db import models
 from django.utils.timezone import get_current_timezone
@@ -101,16 +102,24 @@ class NotableHumanAttribute(models.Model):
     category = models.CharField(max_length=50, choices=AttributeType.choices)
     last_updated = models.DateTimeField(default=now)
 
-    class Meta:
-        unique_together = ("label", "category")  # Prevents duplicate labels in the same category
-
     def __str__(self):
-        return f"{self.label} ({self.get_category_display()})"
+        return f"{self.wikidata_id}: {self.label} ({self.get_category_display()})"
 
 
 class NotableHuman(models.Model):
+    UNRATED_ARTICLE = "unrated"
+    GOOD_ARTICLE = "good"
+    FEATURED_ARTICLE = "featured"
+
+    ARTICLE_QUALITY_CHOICES = [
+        (UNRATED_ARTICLE, "Unrated Article"),
+        (GOOD_ARTICLE, "Good Article"),
+        (FEATURED_ARTICLE, "Featured Article"),
+    ]
+
     wikidata_id = models.CharField(max_length=20, primary_key=True)
     name = models.CharField(max_length=255, blank=True)
+    description = models.CharField(max_length=255, blank=True)
     wikipedia_url = models.URLField(max_length=500, blank=True)
     birth_date = models.DateField(null=True, blank=True)
     is_birth_bc = models.BooleanField(default=False)
@@ -134,7 +143,14 @@ class NotableHuman(models.Model):
     created_at = models.DateTimeField(
         auto_now_add=True,
     )  # Timestamp for record creation
-    last_updated = models.DateTimeField(auto_now=True)
+    last_wikidata_update = models.DateTimeField()
+    article_length = models.IntegerField(null=True, blank=True)
+    article_recent_views = models.IntegerField(null=True, blank=True)
+    article_quality = models.CharField(max_length=10, choices=ARTICLE_QUALITY_CHOICES, default=UNRATED_ARTICLE)
+    article_created_date = models.DateTimeField(null=True, blank=True)
+    article_total_edits = models.IntegerField(null=True, blank=True)
+    article_recent_edits = models.IntegerField(null=True, blank=True)
+    last_wikipedia_update = models.DateTimeField(null=True, blank=True)
 
     def __str__(self):
         return f"{self.name or 'Unknown'} ({self.wikidata_id})"
@@ -232,7 +248,7 @@ class NotableHuman(models.Model):
         """
         # Build the query here, assuming titles is a list
         articles_str = " ".join(
-            [f"<https://en.wikipedia.org/wiki/{title.replace(' ', '_')}>" for title in titles],
+            [f"<https://en.wikipedia.org/wiki/{quote(title.replace(' ', '_'), safe=':/')}>" for title in titles]
         )
         return f""" {query_select}
                           {optional_group_concats}

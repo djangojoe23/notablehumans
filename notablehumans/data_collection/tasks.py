@@ -1,15 +1,20 @@
 import hashlib
 import json
 import time
+from datetime import datetime
 from datetime import timedelta
+from http import HTTPStatus
 
 import redis
 import requests
+from bs4 import BeautifulSoup
 from celery import group
 from celery import shared_task
 from celery.exceptions import Ignore
 from celery.utils.log import get_task_logger
 from django.db import transaction
+from django.db.models import Q
+from django.utils.timezone import get_default_timezone
 from django.utils.timezone import now
 from SPARQLWrapper import JSON
 from SPARQLWrapper import SPARQLWrapper
@@ -29,13 +34,14 @@ LOCK_EXPIRE_TIME = 30  # 30 second expiration for locks
 WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
 WIKIDATA_SPARQL_ENDPOINT = "https://query.wikidata.org/sparql"
 BATCH_SIZE = 50  # Number of titles per batch for SPARQL query
+RATE_LIMIT = "40/m"
 OPTIONAL_FIELD_BATCH_SIZE = 5  # Chunk size of optional fields (attributes) per SPARQL query
 
 # Create a shared session object for reusing HTTP connections
 session = requests.Session()
 
 
-@shared_task(rate_limit="10/m")
+@shared_task(rate_limit=RATE_LIMIT)
 def get_linked_titles_from_day(month, day):
     """
     Fetch the Wikipedia article content for a specific day of the year,
@@ -129,7 +135,7 @@ def is_probably_human(title):
     return all(keyword.lower() not in title.lower() for keyword in non_human_keywords)
 
 
-@shared_task
+@shared_task(rate_limit=RATE_LIMIT)
 def get_human_details_in_batches(month, day, titles):
     """
     Batch process titles and schedule SPARQL queries.
@@ -142,10 +148,11 @@ def get_human_details_in_batches(month, day, titles):
     REDIS_CLIENT.set(f"wiki_batches:{task_id}", len(batches))
 
     # Schedule tasks for each batch
+    batch_count = 1
     for batch in batches:
         # Generate a unique hash for this batch
         batch_hash = hashlib.sha256(json.dumps(batch, sort_keys=True).encode()).hexdigest()
-        lock_key = f"batch_task:{batch_hash}:{int(time.time() // 60)}"
+        lock_key = f"batch_task:{batch_hash}"  # :{int(time.time() // 60)}
 
         # Try to set lock (if key exists, batch is already processing)
         if not REDIS_CLIENT.set(lock_key, "processing", ex=LOCK_EXPIRE_TIME, nx=True):
@@ -153,13 +160,14 @@ def get_human_details_in_batches(month, day, titles):
             continue
 
         get_human_details.apply_async(args=(month, day, batch, task_id))
+        batch_count += 1
 
-    logger.info(f"Started processing {month} {day} {len(batches)} batches. Task ID: {task_id}")
+    logger.info(f"Started processing {len(batches)} batches for {month} {day}. Task ID: {task_id}")
 
 
 def get_query_lock_key(query):
     """Generate a unique lock key for each SPARQL query."""
-    return f"sparql_lock:{hashlib.sha256(query.encode()).hexdigest()}{int(time.time() // 60)}"
+    return f"sparql_lock:{hashlib.sha256(query.encode()).hexdigest()}"  # {int(time.time() // 60)}
 
 
 def chunk_optional_fields(n):
@@ -168,7 +176,7 @@ def chunk_optional_fields(n):
         yield ATTRIBUTE_CHOICES[i : i + n]
 
 
-@shared_task(rate_limit="5/m")
+@shared_task(rate_limit=RATE_LIMIT, time_limit=120, soft_time_limit=100)
 def get_human_details(month, day, titles, task_id):
     max_retries = 5
     base_delay = 2
@@ -177,7 +185,7 @@ def get_human_details(month, day, titles, task_id):
     """
     # Generate a unique hash for this batch
     batch_hash = hashlib.sha256(json.dumps(titles, sort_keys=True).encode()).hexdigest()
-    lock_key = f"human_details_task:{batch_hash}{int(time.time() // 60)}"
+    lock_key = f"human_details_task:{batch_hash}"  # {int(time.time() // 60)}
 
     if not REDIS_CLIENT.set(lock_key, "processing", ex=LOCK_EXPIRE_TIME, nx=True):
         logger.info(f"Human details batch already processing: skipping {batch_hash}")
@@ -191,7 +199,7 @@ def get_human_details(month, day, titles, task_id):
     humans_to_update_dict = {}
     existing_humans = {h.wikidata_id: h for h in NotableHuman.objects.all()}
     recently_updated_humans = NotableHuman.objects.filter(
-        last_updated__gte=two_minutes_ago, last_updated__lt=one_minute_ago
+        last_wikidata_update__gte=two_minutes_ago, last_wikidata_update__lt=one_minute_ago
     )
     recent_human_ids = set(recently_updated_humans.values_list("wikidata_id", flat=True))
 
@@ -206,6 +214,7 @@ def get_human_details(month, day, titles, task_id):
     recent_attribute_ids = set(recently_updated_attributes.values_list("wikidata_id", flat=True))
     try:
         is_first_batch = True
+
         for attribute_batch in chunk_optional_fields(OPTIONAL_FIELD_BATCH_SIZE):
             sparql_query = NotableHuman.get_sparql_query(titles, attribute_batch, is_first_batch)
 
@@ -225,7 +234,6 @@ def get_human_details(month, day, titles, task_id):
             for attempt in range(max_retries):
                 try:
                     results = sparql.query().convert()
-
                     for result in results["results"]["bindings"]:
                         wikidata_id = result["item"]["value"].split("/")[-1]
                         if wikidata_id and wikidata_id in recent_human_ids:
@@ -339,11 +347,13 @@ def get_human_details(month, day, titles, task_id):
                         death_place=existing_places.get(human_data["death_place_id"])
                         if human_data["death_place_id"]
                         else None,
+                        last_wikidata_update=now(),
                     )
                     humans_to_create.append(human)
                 NotableHuman.objects.bulk_create(humans_to_create, ignore_conflicts=True)
-                if humans_to_create:
-                    logger.info(f"Created {len(humans_to_create)} humans including {humans_to_create[0]}")
+                # if humans_to_create:
+                #     logger.info(f"
+                #     {month} {day}: Created {len(humans_to_create)} humans including {humans_to_create[0]}")
 
                 # Map wikidata_id to actual NotableHuman instances
                 humans_created_id_map = {
@@ -379,7 +389,7 @@ def get_human_details(month, day, titles, task_id):
                     human.death_place = (
                         existing_places.get(human_data["death_place_id"]) if human_data["death_place_id"] else None
                     )
-                    human.last_updated = now()
+                    human.last_wikidata_update = now()
                     humans_to_update.append(human)
 
                 # Perform bulk update
@@ -394,11 +404,12 @@ def get_human_details(month, day, titles, task_id):
                         "is_death_bc",
                         "birth_place",
                         "death_place",
-                        "last_updated",
+                        "last_wikidata_update",
                     ],
                 )
-                if humans_to_update:
-                    logger.info(f"Updated {len(humans_to_update)} humans including {humans_to_update[0]}")
+                # if humans_to_update:
+                #     logger.info(f"
+                #     {month} {day}: Updated {len(humans_to_update)} humans including {humans_to_update[0]}")
 
                 # Handle ManyToMany: Attributes ↔ Updated Humans
                 for human, human_data in humans_to_update_dict.items():
@@ -423,31 +434,136 @@ def get_human_details(month, day, titles, task_id):
         if remaining > 0:
             logger.info(f"{remaining} batches left for {month} {day} to process for task {task_id}.")
         else:
-            logger.info(f"All Wikipedia batches have been queried for {month} {day} task {task_id}!")
+            logger.info(f"### ALL BATCHES COMPLETE for {month} {day} task {task_id}! ###")
+            # logger.info(f"Batch {batch_count} out of {num_batches} complete for {month} {day} task {task_id}!")
 
 
 @shared_task
-def schedule_data_collection():
+def schedule_wikidata_data_collection():
     """
     Schedule tasks to fetch Wikipedia article content for all days of the year
     using the Wikipedia API.
     """
     tasks = []
     for month in [
-        "January",  # "February", "March", "April", "May", "June",
+        "January",
+        "February",  # "March", "April", "May", "June",
         # "July", "August", "September", "October", "November", "December"
     ]:
-        for day in range(20, 21):
+        daily_tasks = []
+        for day in range(15, 18):
             lock_key = f"wiki_task:{month}:{day}"
             # Check if a task is already scheduled
             if REDIS_CLIENT.exists(lock_key):
                 logger.info(f"Skipping {month} {day}, already scheduled.")
                 continue  # Skip duplicate tasks
 
-            tasks.append(get_linked_titles_from_day.s(month, day))
+            daily_tasks.append(get_linked_titles_from_day.s(month, day))
+
+        if daily_tasks:
+            # Add the month's tasks as a group of tasks to month_tasks
+            tasks.append(group(daily_tasks))  # Group the tasks for this month
 
     if tasks:
         # Distribute tasks as a group
-        group(tasks).apply_async()
+        group(*tasks).apply_async()  # Apply all month groups simultaneously
 
-    return "Scheduled fetching tasks for all days of the year."
+    return "Scheduled fetching tasks for all days of the year by month."
+
+
+@shared_task
+def schedule_wikipedia_data_collection():
+    # Get all NotableHuman instances with Wikipedia URLs
+    cutoff = now() - timedelta(minutes=2)
+
+    # Log how many humans need a Wikipedia update
+    humans_to_update = NotableHuman.objects.filter(wikipedia_url__isnull=False, wikipedia_url__gt="").filter(
+        Q(last_wikipedia_update__lt=cutoff) | Q(last_wikipedia_update__isnull=True)
+    )
+
+    logger.info(f"Total NotableHumans needing Wikipedia update: {humans_to_update.count()}")
+
+    # Process each NotableHuman and fetch metadata
+    for human in humans_to_update[:100]:
+        # Scrape the Wikipedia Info page for each human
+        page_title = human.wikipedia_url.split("/")[-1]  # Get the last part of the URL as the page title
+        scraped_page_title, metadata = fetch_wikipedia_metadata(page_title)
+
+        if metadata:
+            # # Update NotableHuman instance with the scraped metadata
+            human.wikipedia_url = scraped_page_title
+            human.description = metadata.get("description")
+            human.article_length = metadata.get("page_length")
+            human.article_recent_views = metadata.get("page_views_30_days")
+            human.article_total_edits = metadata.get("edit_count")
+            human.article_recent_edits = metadata.get("recent_edits_30_days")
+            if metadata.get("good_article"):
+                human.article_quality = NotableHuman.GOOD_ARTICLE
+            elif metadata.get("featured_article"):
+                human.article_quality = NotableHuman.FEATURED_ARTICLE
+            human.article_created_date = metadata.get("created_date")
+            human.last_wikipedia_update = now()  # Update the last update timestamp
+            human.save()
+            logger.info(f"Saved Wikipedia metadata for {human.wikipedia_url}")
+
+
+def fetch_wikipedia_metadata(page_title):
+    """
+    Fetches metadata from the Wikipedia Info page for a given page title.
+    """
+    url = f"https://en.wikipedia.org/w/index.php?title={page_title.replace(' ', '_')}&action=info"
+
+    # Send a GET request to the Wikipedia Info page
+    response = requests.get(url, timeout=10)
+
+    if response.status_code == HTTPStatus.OK:
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        metadata = {}
+
+        redirect_row = soup.find("tr", {"id": "mw-pageinfo-redirectsto"})
+        if redirect_row:
+            # If a redirect exists, extract the redirected article's title
+            redirect_link = redirect_row.find_all("td")[1].find("a")["href"]
+            redirected_page_title = redirect_link.split("/")[-1]
+
+            # Fetch metadata from the redirected page
+            return fetch_wikipedia_metadata(redirected_page_title)
+
+        rows = soup.find_all("tr")
+        for row in rows:
+            tds = row.find_all("td")
+            if tds and tds[0].text.strip() == "Local description":
+                metadata["description"] = row.find_all("td")[1].text.strip()
+
+        # Check for the presence of the "Category:Good articles" link
+        good_articles_link = soup.find("a", {"title": "Category:Good articles"})
+        metadata["good_article"] = bool(good_articles_link)
+
+        # Check for the presence of the "Category:Featured articles" link
+        featured_articles_link = soup.find("a", {"title": "Category:Featured articles"})
+        metadata["featured_article"] = bool(featured_articles_link)
+
+        # Mapping of the IDs to metadata labels
+        metadata_ids = {
+            "mw-pageinfo-length": "page_length",
+            "mw-pvi-month-count": "page_views_30_days",
+            "mw-pageinfo-firsttime": "created_date",
+            "mw-pageinfo-edits": "edit_count",
+            "mw-pageinfo-recent-edits": "recent_edits_30_days",
+        }
+
+        # Loop through each id in the mapping and extract the data
+        for row_id, label in metadata_ids.items():
+            row = soup.find("tr", {"id": row_id})
+            if row:
+                value = row.find_all("td")[1].text.strip()
+                if label != "created_date":
+                    value = int(value.replace(",", ""))
+                else:
+                    value = datetime.strptime(value, "%H:%M, %d %B %Y")
+                    value = value.replace(tzinfo=get_default_timezone())
+                metadata[label] = value
+
+        return page_title, metadata
+    return page_title, None  # Return None if the page request fails
