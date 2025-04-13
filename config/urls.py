@@ -24,7 +24,7 @@ urlpatterns = [
     path("users/", include("notablehumans.users.urls", namespace="users")),
     path("accounts/", include("allauth.urls")),
     # Your stuff: custom urls includes go here
-    # ...
+    # path("notable-humans/", include("notablehumans.data_collection.urls", namespace="notable-humans")),
     # Media files
     *static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT),
 ]

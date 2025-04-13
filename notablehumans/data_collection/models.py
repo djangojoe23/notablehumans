@@ -1,6 +1,7 @@
 from datetime import datetime
 from urllib.parse import quote
 
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils.timezone import get_current_timezone
 from django.utils.timezone import now
@@ -8,7 +9,7 @@ from django.utils.timezone import now
 
 class Place(models.Model):
     wikidata_id = models.CharField(max_length=255, primary_key=True)
-    name = models.CharField(max_length=255, unique=True)
+    name = models.CharField(max_length=255)
     latitude = models.DecimalField(
         max_digits=9,
         decimal_places=6,
@@ -105,6 +106,11 @@ class NotableHumanAttribute(models.Model):
     def __str__(self):
         return f"{self.wikidata_id}: {self.label} ({self.get_category_display()})"
 
+    def save(self, *args, **kwargs):
+        if self.category not in dict(AttributeType.choices):
+            raise ValidationError(f"Invalid category: {self.category}")
+        super().save(*args, **kwargs)
+
 
 class NotableHuman(models.Model):
     UNRATED_ARTICLE = "unrated"
@@ -123,8 +129,10 @@ class NotableHuman(models.Model):
     wikipedia_url = models.URLField(max_length=500, blank=True)
     birth_date = models.DateField(null=True, blank=True)
     is_birth_bc = models.BooleanField(default=False)
+    birth_year = models.IntegerField(null=True, blank=True, editable=False)
     death_date = models.DateField(null=True, blank=True)
-    is_death_bc = models.BooleanField(default=False)  # Flag to mark BC dates
+    is_death_bc = models.BooleanField(default=False)
+    death_year = models.IntegerField(null=True, blank=True, editable=False)
     birth_place = models.ForeignKey(
         Place,
         related_name="births",
@@ -312,3 +320,16 @@ class NotableHuman(models.Model):
 
     def get_occupations(self):
         return self.attributes.filter(category=AttributeType.OCCUPATION)
+
+    def save(self, *args, **kwargs):
+        if self.birth_date:
+            self.birth_year = -self.birth_date.year if self.is_birth_bc else self.birth_date.year
+        else:
+            self.birth_year = None
+
+        if self.death_date:
+            self.death_year = -self.death_date.year if self.is_death_bc else self.death_date.year
+        else:
+            self.death_year = None
+
+        super().save(*args, **kwargs)

@@ -15,6 +15,7 @@ from celery.utils.log import get_task_logger
 from django.db import transaction
 from django.db.models import Q
 from django.utils.timezone import get_default_timezone
+from django.utils.timezone import make_aware
 from django.utils.timezone import now
 from SPARQLWrapper import JSON
 from SPARQLWrapper import SPARQLWrapper
@@ -34,7 +35,7 @@ LOCK_EXPIRE_TIME = 30  # 30 second expiration for locks
 WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
 WIKIDATA_SPARQL_ENDPOINT = "https://query.wikidata.org/sparql"
 BATCH_SIZE = 50  # Number of titles per batch for SPARQL query
-RATE_LIMIT = "40/m"
+RATE_LIMIT = "20/m"
 OPTIONAL_FIELD_BATCH_SIZE = 5  # Chunk size of optional fields (attributes) per SPARQL query
 
 # Create a shared session object for reusing HTTP connections
@@ -447,11 +448,15 @@ def schedule_wikidata_data_collection():
     tasks = []
     for month in [
         "January",
-        "February",  # "March", "April", "May", "June",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
         # "July", "August", "September", "October", "November", "December"
     ]:
         daily_tasks = []
-        for day in range(15, 18):
+        for day in range(1, 32):
             lock_key = f"wiki_task:{month}:{day}"
             # Check if a task is already scheduled
             if REDIS_CLIENT.exists(lock_key):
@@ -474,8 +479,10 @@ def schedule_wikidata_data_collection():
 @shared_task
 def schedule_wikipedia_data_collection():
     # Get all NotableHuman instances with Wikipedia URLs
-    cutoff = now() - timedelta(minutes=2)
+    cutoff = now() - timedelta(weeks=4)
 
+    print(NotableHuman.objects.filter(description__exact="").count())
+    print("That was the number of humans with no description!\n\n")
     # Log how many humans need a Wikipedia update
     humans_to_update = NotableHuman.objects.filter(wikipedia_url__isnull=False, wikipedia_url__gt="").filter(
         Q(last_wikipedia_update__lt=cutoff) | Q(last_wikipedia_update__isnull=True)
@@ -483,14 +490,25 @@ def schedule_wikipedia_data_collection():
 
     logger.info(f"Total NotableHumans needing Wikipedia update: {humans_to_update.count()}")
 
-    # Process each NotableHuman and fetch metadata
-    for human in humans_to_update[:100]:
-        # Scrape the Wikipedia Info page for each human
-        page_title = human.wikipedia_url.split("/")[-1]  # Get the last part of the URL as the page title
+    batch_size = 50
+    human_ids_batches = [
+        list(humans_to_update.values_list("wikidata_id", flat=True)[i : i + batch_size])
+        for i in range(0, humans_to_update.count(), batch_size)
+    ]
+
+    job = group(process_wikipedia_batch.s(batch) for batch in human_ids_batches)
+    job.apply_async()
+
+
+@shared_task(time_limit=150, soft_time_limit=120)
+def process_wikipedia_batch(human_ids):
+    humans = NotableHuman.objects.filter(wikidata_id__in=human_ids)
+
+    for human in humans:
+        page_title = human.wikipedia_url.split("/")[-1]
         scraped_page_title, metadata = fetch_wikipedia_metadata(page_title)
 
         if metadata:
-            # # Update NotableHuman instance with the scraped metadata
             human.wikipedia_url = scraped_page_title
             human.description = metadata.get("description")
             human.article_length = metadata.get("page_length")
@@ -502,9 +520,10 @@ def schedule_wikipedia_data_collection():
             elif metadata.get("featured_article"):
                 human.article_quality = NotableHuman.FEATURED_ARTICLE
             human.article_created_date = metadata.get("created_date")
-            human.last_wikipedia_update = now()  # Update the last update timestamp
+            human.last_wikipedia_update = now()
             human.save()
             logger.info(f"Saved Wikipedia metadata for {human.wikipedia_url}")
+    time.sleep(2)
 
 
 def fetch_wikipedia_metadata(page_title):
@@ -530,11 +549,22 @@ def fetch_wikipedia_metadata(page_title):
             # Fetch metadata from the redirected page
             return fetch_wikipedia_metadata(redirected_page_title)
 
-        rows = soup.find_all("tr")
-        for row in rows:
-            tds = row.find_all("td")
-            if tds and tds[0].text.strip() == "Local description":
-                metadata["description"] = row.find_all("td")[1].text.strip()
+        description = ""
+        for row in soup.find_all("tr"):
+            first_td = row.find("td")  # Get the first <td>
+            if first_td and "Local description" in first_td.text:
+                description_td = row.find_all("td")[1]  # Second <td> contains the description
+                description = description_td.text.strip()
+                break  # Stop after finding the first match
+        else:
+            for row in soup.find_all("tr"):
+                first_td = row.find("td")  # Get the first <td>
+                if first_td and "Central description" in first_td.text:
+                    description_td = row.find_all("td")[1]  # Second <td> contains the description
+                    description = description_td.text.strip()
+                    break  # Stop after finding the first match
+
+        metadata["description"] = description
 
         # Check for the presence of the "Category:Good articles" link
         good_articles_link = soup.find("a", {"title": "Category:Good articles"})
@@ -562,7 +592,7 @@ def fetch_wikipedia_metadata(page_title):
                     value = int(value.replace(",", ""))
                 else:
                     value = datetime.strptime(value, "%H:%M, %d %B %Y")
-                    value = value.replace(tzinfo=get_default_timezone())
+                    value = make_aware(value, timezone=get_default_timezone())
                 metadata[label] = value
 
         return page_title, metadata
