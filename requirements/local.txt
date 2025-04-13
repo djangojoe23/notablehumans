@@ -36,6 +36,3 @@ pytest-django==4.9.0  # https://github.com/pytest-dev/pytest-django
 
 # My Stuff
 # ------------------------------------------------------------------------------
-django-ratelimit==4.1.0
-requests==2.32.3
-SPARQLWrapper==2.0.0

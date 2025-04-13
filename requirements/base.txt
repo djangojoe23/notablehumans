@@ -25,3 +25,7 @@ django-cors-headers==4.6.0  # https://github.com/adamchainz/django-cors-headers
 drf-spectacular==0.28.0  # https://github.com/tfranzel/drf-spectacular
 
 beautifulsoup4==4.13.3
+django-ratelimit==4.1.0
+requests==2.32.3
+SPARQLWrapper==2.0.0
+tqdm~=4.67.1
