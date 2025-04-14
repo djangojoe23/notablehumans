@@ -11,10 +11,18 @@ from ...models import NotableHuman
 class Command(BaseCommand):
     help = "Export NotableHumans with valid birth locations to GeoJSON"
 
-    def handle(self, *args, **kwargs):
+    def add_arguments(self, parser):
+        parser.add_argument('--limit', type=int, default=None, help='Limit number of humans to export')
+
+    def handle(self, *args, **options):
+        limit = options['limit']
+
         humans = NotableHuman.objects.filter(
             birth_year__isnull=False, birth_place__latitude__isnull=False, birth_place__longitude__isnull=False
         ).distinct()
+
+        if limit:
+            humans = humans[:limit]
 
         def abbreviate_properties(human):
             mapping = {
@@ -34,15 +42,22 @@ class Command(BaseCommand):
 
             props = {}
 
+            # Handle direct fields
             for full_key, short_key in mapping.items():
-                val = getattr(human, full_key, None) if hasattr(human, full_key) else None
+                val = getattr(human, full_key, None)
                 if val is not None:
-                    # 🔁 Convert datetime to string
                     if isinstance(val, datetime):
                         val = val.isoformat()
                     props[short_key] = val
 
-            # Add attribute categories
+            # Handle related foreign key fields
+            if human.birth_place and human.birth_place.name:
+                props["bp"] = human.birth_place.name
+
+            if human.death_place and human.death_place.name:
+                props["dp"] = human.death_place.name
+
+            # Handle M2M attribute categories
             for category, short in sorted({
                                               "academic_degree": "ad",
                                               "award_received": "ar",
