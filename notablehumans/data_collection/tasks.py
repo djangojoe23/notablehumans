@@ -1,12 +1,15 @@
 import hashlib
 import json
 import time
-from datetime import datetime
 from datetime import timedelta
 from http import HTTPStatus
+from dateutil import parser as dateparser
+from dateutil.parser import ParserError
+import re
 
 import redis
 import requests
+import random
 from bs4 import BeautifulSoup
 from celery import group
 from celery import shared_task
@@ -235,6 +238,7 @@ def get_human_details(month, day, titles, task_id):
             for attempt in range(max_retries):
                 try:
                     results = sparql.query().convert()
+                    time.sleep(random.uniform(0.8, 1.4))
                     for result in results["results"]["bindings"]:
                         wikidata_id = result["item"]["value"].split("/")[-1]
                         if wikidata_id and wikidata_id in recent_human_ids:
@@ -244,7 +248,8 @@ def get_human_details(month, day, titles, task_id):
                         name = result["itemLabel"]["value"]
                         human_data = {"name": name}
                         if is_first_batch:
-                            wikipedia_url = result.get("article", {}).get("value")
+                            raw_url = result.get("article", {}).get("value")
+                            wikipedia_url = raw_url.rsplit("/", 1)[-1] if raw_url else ""
                             birth_date, is_birth_bc = NotableHuman.parse_date(
                                 result.get("dobValues", {}).get("value"), result.get("dobStatements", {}).get("value")
                             )
@@ -323,6 +328,8 @@ def get_human_details(month, day, titles, task_id):
                     logger.error(f"SPARQL query failed: {e}")
                     break
             is_first_batch = False
+            time.sleep(1)  # To avoid hammering endpoint with batches back to back
+
         # Perform bulk operations inside a transaction
         try:
             with transaction.atomic():
@@ -453,7 +460,7 @@ def schedule_wikidata_data_collection():
         "April",
         "May",
         "June",
-        # "July", "August", "September", "October", "November", "December"
+        "July", "August", "September", "October", "November", "December"
     ]:
         daily_tasks = []
         for day in range(1, 32):
@@ -463,6 +470,7 @@ def schedule_wikidata_data_collection():
                 logger.info(f"Skipping {month} {day}, already scheduled.")
                 continue  # Skip duplicate tasks
 
+            delay_seconds = random.randint(0, 600)  # delay up to 10 minutes
             daily_tasks.append(get_linked_titles_from_day.s(month, day))
 
         if daily_tasks:
@@ -490,14 +498,25 @@ def schedule_wikipedia_data_collection():
 
     logger.info(f"Total NotableHumans needing Wikipedia update: {humans_to_update.count()}")
 
+    all_ids = list(humans_to_update.values_list("wikidata_id", flat=True))
     batch_size = 50
     human_ids_batches = [
-        list(humans_to_update.values_list("wikidata_id", flat=True)[i : i + batch_size])
-        for i in range(0, humans_to_update.count(), batch_size)
+        all_ids[i: i + batch_size] for i in range(0, len(all_ids), batch_size)
     ]
 
-    job = group(process_wikipedia_batch.s(batch) for batch in human_ids_batches)
-    job.apply_async()
+    # check for any missing
+    scheduled_ids = {wid for batch in human_ids_batches for wid in batch}
+    missing = set(all_ids) - scheduled_ids
+    if missing:
+        logger.error(f"‼️  Missing from scheduling: {missing}")
+
+    logger.info(
+        f"Split into {len(human_ids_batches)} batches, "
+        f"{sum(len(b) for b in human_ids_batches)} scheduled IDs"
+    )
+
+    tasks = [process_wikipedia_batch.s(batch) for batch in human_ids_batches]
+    group(*tasks).apply_async()
 
 
 @shared_task(time_limit=150, soft_time_limit=120)
@@ -505,24 +524,27 @@ def process_wikipedia_batch(human_ids):
     humans = NotableHuman.objects.filter(wikidata_id__in=human_ids)
 
     for human in humans:
-        page_title = human.wikipedia_url.split("/")[-1]
-        scraped_page_title, metadata = fetch_wikipedia_metadata(page_title)
+        try:
+            page_title = human.wikipedia_url.split("/")[-1]
+            scraped_page_title, metadata = fetch_wikipedia_metadata(page_title)
 
-        if metadata:
-            human.wikipedia_url = scraped_page_title
-            human.description = metadata.get("description")
-            human.article_length = metadata.get("page_length")
-            human.article_recent_views = metadata.get("page_views_30_days")
-            human.article_total_edits = metadata.get("edit_count")
-            human.article_recent_edits = metadata.get("recent_edits_30_days")
-            if metadata.get("good_article"):
-                human.article_quality = NotableHuman.GOOD_ARTICLE
-            elif metadata.get("featured_article"):
-                human.article_quality = NotableHuman.FEATURED_ARTICLE
-            human.article_created_date = metadata.get("created_date")
-            human.last_wikipedia_update = now()
-            human.save()
-            logger.info(f"Saved Wikipedia metadata for {human.wikipedia_url}")
+            if metadata:
+                human.wikipedia_url = scraped_page_title
+                human.description = metadata.get("description")
+                human.article_length = metadata.get("page_length")
+                human.article_recent_views = metadata.get("page_views_30_days")
+                human.article_total_edits = metadata.get("edit_count")
+                human.article_recent_edits = metadata.get("recent_edits_30_days")
+                if metadata.get("good_article"):
+                    human.article_quality = NotableHuman.GOOD_ARTICLE
+                elif metadata.get("featured_article"):
+                    human.article_quality = NotableHuman.FEATURED_ARTICLE
+                human.article_created_date = metadata.get("created_date")
+                human.last_wikipedia_update = now()
+                human.save()
+                logger.info(f"Saved Wikipedia metadata for {human.wikipedia_url}")
+        except Exception as e:
+            logger.error(f"Error updating human {human.wikidata_id}: {e}")
     time.sleep(2)
 
 
@@ -530,6 +552,7 @@ def fetch_wikipedia_metadata(page_title):
     """
     Fetches metadata from the Wikipedia Info page for a given page title.
     """
+    page_title = page_title.split("#", 1)[0]
     url = f"https://en.wikipedia.org/w/index.php?title={page_title.replace(' ', '_')}&action=info"
 
     # Send a GET request to the Wikipedia Info page
@@ -552,14 +575,14 @@ def fetch_wikipedia_metadata(page_title):
         description = ""
         for row in soup.find_all("tr"):
             first_td = row.find("td")  # Get the first <td>
-            if first_td and "Local description" in first_td.text:
+            if first_td and "Central description" in first_td.text:
                 description_td = row.find_all("td")[1]  # Second <td> contains the description
                 description = description_td.text.strip()
                 break  # Stop after finding the first match
         else:
             for row in soup.find_all("tr"):
                 first_td = row.find("td")  # Get the first <td>
-                if first_td and "Central description" in first_td.text:
+                if first_td and "Local description" in first_td.text:
                     description_td = row.find_all("td")[1]  # Second <td> contains the description
                     description = description_td.text.strip()
                     break  # Stop after finding the first match
@@ -586,14 +609,46 @@ def fetch_wikipedia_metadata(page_title):
         # Loop through each id in the mapping and extract the data
         for row_id, label in metadata_ids.items():
             row = soup.find("tr", {"id": row_id})
-            if row:
-                value = row.find_all("td")[1].text.strip()
-                if label != "created_date":
-                    value = int(value.replace(",", ""))
-                else:
-                    value = datetime.strptime(value, "%H:%M, %d %B %Y")
-                    value = make_aware(value, timezone=get_default_timezone())
-                metadata[label] = value
+            if not row:
+                logger.warning(f"No row for {row_id}")
+                continue
+
+            cells = row.find_all("td")
+            if len(cells) < 2:
+                logger.warning(f"Expected 2 <td> in {row_id}, found {len(cells)}")
+                continue
+
+            text = cells[1].get_text(strip=True)  # <<–– now the *value* cell
+
+            if label == "created_date":
+                try:
+                    dt = dateparser.parse(text)
+                    metadata[label] = make_aware(dt, get_default_timezone())
+                except (ParserError, ValueError, TypeError):
+                    logger.warning(f"Failed to parse date '{text}' in {row_id}")
+            else:
+                digits = re.sub(r"\D", "", text)
+                try:
+                    metadata[label] = int(digits)
+                except ValueError:
+                    logger.warning(f"No digits found in '{text}' for {row_id}")
 
         return page_title, metadata
     return page_title, None  # Return None if the page request fails
+
+
+@shared_task
+def reprocess_missing_created_dates():
+    # 1) Get all Wikidata IDs still lacking a created date
+    qids = list(
+        NotableHuman.objects
+        .filter(article_created_date__isnull=True, wikipedia_url__isnull=False)
+        .values_list("wikidata_id", flat=True)
+    )
+
+    # 2) Split into batches
+    batches = [qids[i : i + BATCH_SIZE] for i in range(0, len(qids), BATCH_SIZE)]
+
+    # 3) Fire off one process_wikipedia_batch job per batch
+    job = group(process_wikipedia_batch.s(batch) for batch in batches)
+    job.apply_async()

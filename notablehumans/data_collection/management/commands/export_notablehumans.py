@@ -29,9 +29,12 @@ class Command(BaseCommand):
                 "wikidata_id": "id",
                 "wikipedia_url": "wu",
                 "name": "n",
+                "description": "d",
                 "birth_year": "by",
+                "birth_date": "bd",
                 "birth_place_name": "bp",
                 "death_year": "dy",
+                "death_date": "dd",
                 "death_place_name": "dp",
                 "article_created_date": "cd",
                 "article_length": "al",
@@ -46,7 +49,7 @@ class Command(BaseCommand):
             for full_key, short_key in mapping.items():
                 val = getattr(human, full_key, None)
                 if val is not None:
-                    if isinstance(val, datetime):
+                    if hasattr(val, "isoformat"):
                         val = val.isoformat()
                     props[short_key] = val
 
